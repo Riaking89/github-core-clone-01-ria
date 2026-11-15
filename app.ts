@@ -392,7 +392,48 @@ function readPackEntryHeader(buf: Buffer, offset: number): { type: number; size:
  * length: a truncated slice throws, the exact slice (or longer) succeeds, and the smallest
  * succeeding length is the stream's end. `expectedSize` (the header's size) confirms the match.
  */
+/** Adler-32 (RFC 1950) of `data`: the checksum that ends every zlib stream. */
+function adler32(data: Buffer): number {
+  let a = 1;
+  let b = 0;
+  let offset = 0;
+  while (offset < data.length) {
+    // 5552 is the largest block that cannot overflow the accumulators before the mod.
+    const end = Math.min(data.length, offset + 5552);
+    while (offset < end) {
+      a += data[offset] as number;
+      b += a;
+      offset += 1;
+    }
+    a %= 65521;
+    b %= 65521;
+  }
+  return b * 65536 + a;
+}
+
 function inflateOne(buf: Buffer, offset: number, expectedSize: number): { data: Buffer; consumed: number } {
+  // Fast path: inflateSync ignores bytes after the stream's end, so one call on the whole
+  // remainder yields the object. The stream ends with its Adler-32 checksum, which locates
+  // the exact end; a confirming inflate of that exact slice guards against a coincidental
+  // earlier match. Any surprise falls back to the binary search below, which is slow but
+  // makes no assumption about the stream layout.
+  try {
+    const data = inflateSync(buf.subarray(offset));
+    if (data.length === expectedSize) {
+      const needle = Buffer.alloc(4);
+      needle.writeUInt32BE(adler32(data), 0);
+      const at = buf.indexOf(needle, offset + 2);
+      if (at >= 0) {
+        const end = at + 4;
+        const check = inflateSync(buf.subarray(offset, end));
+        if (check.length === expectedSize && check.equals(data)) {
+          return { data, consumed: end - offset };
+        }
+      }
+    }
+  } catch {
+    // Fall through to the binary search.
+  }
   let lo = offset;
   let hi = buf.length;
   // Find the smallest end such that inflate succeeds and yields expectedSize bytes.
@@ -601,6 +642,11 @@ interface Repo {
   nextCommentId: number;
   seq: number;
   serverCommitSeq: number;
+  // The commit graph, parsed once per object and cached: a commit's tree and parents.
+  // Objects are content-addressed and only ever added (never mutated or removed), so a
+  // cached parse can never go stale. The graph walks (ancestor checks, shallow fetches,
+  // merge-base) read this instead of re-parsing the same commit bodies on every walk.
+  commitGraph: Map<string, { tree: string; parents: readonly string[] }>;
 }
 
 const repos = new Map<string, Repo>();
@@ -633,6 +679,7 @@ function createRepoRecord(owner: string, name: string, description: string, isPr
     nextCommentId: 1,
     seq: 0,
     serverCommitSeq: 0,
+    commitGraph: new Map(),
   };
   nextRepoId += 1;
   repos.set(repoKey(owner, name), repo);
@@ -706,25 +753,61 @@ function treeFromFlat(repo: Repo, flat: ReadonlyMap<string, { oid: string; mode:
   return build('');
 }
 
+/**
+ * A commit's graph fields (its tree and its parents), parsed once and cached in the repo.
+ * Returns undefined when the object is absent or is not a commit. The cached parents array
+ * is frozen: callers only ever iterate it, and a shared array must never be mutated.
+ */
+function commitGraphOf(repo: Repo, oid: string): { tree: string; parents: readonly string[] } | undefined {
+  const cached = repo.commitGraph.get(oid);
+  if (cached !== undefined) return cached;
+  const obj = repo.objects.get(oid);
+  if (obj === undefined || obj.type !== 'commit') return undefined;
+  const commit = parseCommit(obj.data);
+  const graph = { tree: commit.tree, parents: Object.freeze(commit.parents) };
+  repo.commitGraph.set(oid, graph);
+  return graph;
+}
+
 /** All commit oids reachable from `tips` (following every parent), in BFS order. */
 function reachableCommits(repo: Repo, tips: readonly string[]): Set<string> {
   const seen = new Set<string>();
   const queue: string[] = [...tips];
-  while (queue.length > 0) {
-    const oid = queue.shift() as string;
+  let head = 0;
+  while (head < queue.length) {
+    const oid = queue[head] as string;
+    head += 1;
     if (seen.has(oid)) continue;
-    const obj = repo.objects.get(oid);
-    if (obj === undefined || obj.type !== 'commit') continue;
+    const graph = commitGraphOf(repo, oid);
+    if (graph === undefined) continue;
     seen.add(oid);
-    for (const parent of parseCommit(obj.data).parents) queue.push(parent);
+    for (const parent of graph.parents) queue.push(parent);
   }
   return seen;
 }
 
-/** Is `ancestor` reachable from `descendant` (a commit is its own ancestor)? */
+/**
+ * Is `ancestor` reachable from `descendant` (a commit is its own ancestor)? Unlike the old
+ * version, which walked the descendant's whole history and only then asked whether the
+ * ancestor was in it, this stops the moment the ancestor is found — a chain push, whose new
+ * commit's parent IS the current tip, answers in one step instead of re-parsing history.
+ */
 function isAncestor(repo: Repo, ancestor: string, descendant: string): boolean {
   if (ancestor === descendant) return true;
-  return reachableCommits(repo, [descendant]).has(ancestor);
+  const seen = new Set<string>();
+  const queue: string[] = [descendant];
+  let head = 0;
+  while (head < queue.length) {
+    const oid = queue[head] as string;
+    head += 1;
+    if (seen.has(oid)) continue;
+    seen.add(oid);
+    if (oid === ancestor) return true;
+    const graph = commitGraphOf(repo, oid);
+    if (graph === undefined) continue;
+    for (const parent of graph.parents) queue.push(parent);
+  }
+  return false;
 }
 
 /** The merge-base of two tips: the common ancestor closest to both (BFS from the second tip). */
@@ -732,15 +815,16 @@ function mergeBase(repo: Repo, a: string, b: string): string | null {
   const ancestorsA = reachableCommits(repo, [a]);
   const queue: string[] = [b];
   const seen = new Set<string>();
-  while (queue.length > 0) {
-    const oid = queue.shift() as string;
+  let head = 0;
+  while (head < queue.length) {
+    const oid = queue[head] as string;
+    head += 1;
     if (seen.has(oid)) continue;
     seen.add(oid);
     if (ancestorsA.has(oid)) return oid;
-    const obj = repo.objects.get(oid);
-    if (obj !== undefined && obj.type === 'commit') {
-      for (const parent of parseCommit(obj.data).parents) queue.push(parent);
-    }
+    const graph = commitGraphOf(repo, oid);
+    if (graph === undefined) continue;
+    for (const parent of graph.parents) queue.push(parent);
   }
   return null;
 }
@@ -751,18 +835,19 @@ function shallowCommits(repo: Repo, tips: readonly string[], depth: number): { i
   const boundary = new Set<string>();
   const queue: Array<{ oid: string; d: number }> = tips.map((oid) => ({ oid, d: 1 }));
   const seen = new Set<string>();
-  while (queue.length > 0) {
-    const { oid, d } = queue.shift() as { oid: string; d: number };
+  let head = 0;
+  while (head < queue.length) {
+    const { oid, d } = queue[head] as { oid: string; d: number };
+    head += 1;
     if (seen.has(oid)) continue;
     seen.add(oid);
-    const obj = repo.objects.get(oid);
-    if (obj === undefined || obj.type !== 'commit') continue;
+    const graph = commitGraphOf(repo, oid);
+    if (graph === undefined) continue;
     included.add(oid);
-    const commit = parseCommit(obj.data);
     if (d >= depth) {
-      if (commit.parents.length > 0) boundary.add(oid);
+      if (graph.parents.length > 0) boundary.add(oid);
     } else {
-      for (const parent of commit.parents) queue.push({ oid: parent, d: d + 1 });
+      for (const parent of graph.parents) queue.push({ oid: parent, d: d + 1 });
     }
   }
   return { included, boundary };
@@ -816,9 +901,9 @@ function fetchSelection(
   // A held shallow boundary whose parents are now all present is unshallow.
   const present = new Set([...heldCommits, ...wantedCommits]);
   const unshallow = oldBoundary.filter((oid) => {
-    const obj = repo.objects.get(oid);
-    if (obj === undefined || obj.type !== 'commit') return false;
-    return parseCommit(obj.data).parents.every((parent) => present.has(parent));
+    const graph = commitGraphOf(repo, oid);
+    if (graph === undefined) return false;
+    return graph.parents.every((parent) => present.has(parent));
   });
   const shallow = [...boundary].filter((oid) => !heldCommits.has(oid));
   // The object closure of a commit set: its commits plus every tree and blob under them.
@@ -836,8 +921,8 @@ function fetchSelection(
       }
     };
     for (const commitOid of commits) {
-      const obj = repo.objects.get(commitOid);
-      if (obj !== undefined && obj.type === 'commit') collectTree(parseCommit(obj.data).tree);
+      const graph = commitGraphOf(repo, commitOid);
+      if (graph !== undefined) collectTree(graph.tree);
     }
     return { trees, blobs };
   };
