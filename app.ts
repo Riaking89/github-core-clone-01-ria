@@ -126,8 +126,13 @@ const VIEWER = USERS[0] as ScenarioUser;
 const STRANGER = USERS[2] as ScenarioUser;
 
 /** A deterministic timestamp string from a sequence number (never a wall clock). */
+const SEQ_TIME_CACHE = new Map<number, string>();
 function seqTime(seq: number): string {
-  return new Date((FIXED_EPOCH_SEC + seq) * 1000).toISOString();
+  const cached = SEQ_TIME_CACHE.get(seq);
+  if (cached !== undefined) return cached;
+  const text = new Date((FIXED_EPOCH_SEC + seq) * 1000).toISOString();
+  SEQ_TIME_CACHE.set(seq, text);
+  return text;
 }
 
 // ------------------------------------------------------------------ git objects
@@ -687,9 +692,14 @@ function createRepoRecord(owner: string, name: string, description: string, isPr
 }
 
 /** The global id of a repository / issue / pull request: opaque, stable, deterministic. */
+const GLOBAL_ID_CACHE = new Map<string, string>();
 function globalId(kind: string, databaseId: number, number?: number): string {
   const raw = number === undefined ? `${kind}:${databaseId}` : `${kind}:${databaseId}:${number}`;
-  return Buffer.from(raw, 'utf8').toString('base64');
+  const cached = GLOBAL_ID_CACHE.get(raw);
+  if (cached !== undefined) return cached;
+  const id = Buffer.from(raw, 'utf8').toString('base64');
+  GLOBAL_ID_CACHE.set(raw, id);
+  return id;
 }
 
 function parseGlobalId(id: string): { kind: string; databaseId: number; number?: number } | null {
@@ -1201,9 +1211,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function bearerToken(req: IncomingMessage): string | null {
   const header = req.headers.authorization;
-  if (header === undefined) return null;
-  const match = /^Bearer (.+)$/.exec(header);
-  return match === null ? null : (match[1] as string);
+  if (header === undefined || !header.startsWith('Bearer ')) return null;
+  const token = header.slice(7);
+  return token === '' ? null : token;
 }
 
 /** The token is valid when it matches the suite token (or, with no suite token set, any non-empty one). */
